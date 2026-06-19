@@ -1,0 +1,8 @@
+node_modules/
+user/
+.env
+image/
+.vscode/
+.agents/
+data/
+dot/
