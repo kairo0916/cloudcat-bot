@@ -2046,6 +2046,12 @@ async function registerCommands() {
 }
 
 client.once('clientReady', async () => {
+
+  await client.music.init();
+  console.log('音樂系統初始化完成');
+  // 檢查節點
+  console.log('當前節點狀態:', client.lavalink.nodeManager.nodes.map(n => ({ id: n.id, connected: n.connected })));
+
   const endTime = process.hrtime.bigint();
   const durationNs = endTime - startTime;
   const durationMs = Number(durationNs) / 1e6;

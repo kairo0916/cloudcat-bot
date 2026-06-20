@@ -4,7 +4,9 @@ const storage = require('./storage');
 
 function createPlayerManager(ctx) {
   async function getGuildState(guildId) {
-    return storage.loadDocument(storage.COLLECTIONS.guilds, guildId) || {
+    // 修復：必須先 await 等待結果出來，再判斷是否為 null，預設物件才會生效
+    const doc = await storage.loadDocument(storage.COLLECTIONS.guilds, guildId);
+    return doc || {
       _id: guildId,
       guildId,
       queue: { current: null, previous: [], tracks: [], repeatMode: 'off' },
@@ -24,13 +26,15 @@ function createPlayerManager(ctx) {
 
   async function saveGuildState(guildId, patch) {
     const current = await getGuildState(guildId);
+    
+    // 加強容錯：確保 current.queue, current.state 等物件存在，避免展開 null 報錯
     const next = {
       ...current,
       ...patch,
-      queue: patch.queue ? { ...current.queue, ...patch.queue } : current.queue,
-      state: patch.state ? { ...current.state, ...patch.state } : current.state,
-      settings: patch.settings ? { ...current.settings, ...patch.settings } : current.settings,
-      stats: patch.stats ? { ...current.stats, ...patch.stats } : current.stats,
+      queue: patch.queue ? { ...(current.queue || {}), ...patch.queue } : current.queue,
+      state: patch.state ? { ...(current.state || {}), ...patch.state } : current.state,
+      settings: patch.settings ? { ...(current.settings || {}), ...patch.settings } : current.settings,
+      stats: patch.stats ? { ...(current.stats || {}), ...patch.stats } : current.stats,
       updatedAt: new Date().toISOString(),
     };
     await storage.saveDocument(storage.COLLECTIONS.guilds, guildId, next);
@@ -46,13 +50,20 @@ function createPlayerManager(ctx) {
     let player = getPlayer(guildId);
 
     if (!player) {
-      player = ctx.manager.createPlayer({
-        guildId,
-        voiceChannelId,
-        textChannelId,
-        selfDeaf: true,
-        volume: musicConfig.defaultVolume,
-      });
+      try {
+        player = ctx.manager.createPlayer({
+          guildId,
+          voiceChannelId,
+          textChannelId,
+          selfDeaf: true,
+          volume: musicConfig.defaultVolume,
+        });
+      } catch (err) {
+        if (err.message.includes('No available Node')) {
+          throw new Error('音樂伺服器 (Lavalink) 尚未連線或無可用節點，請稍後再試！');
+        }
+        throw err;
+      }
     }
 
     if (!player.connected) {

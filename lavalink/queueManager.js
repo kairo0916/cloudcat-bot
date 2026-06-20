@@ -67,6 +67,17 @@ function interleaveTracksByRequester(tracks) {
   return ordered;
 }
 
+// 修復：建立一個手動序列化隊列的輔助函式，取代原先的 .toJSON()
+function serializeQueue(player) {
+  if (!player || !player.queue) return { current: null, previous: [], tracks: [], repeatMode: 'off' };
+  return {
+    current: player.queue.current || null,
+    previous: Array.isArray(player.queue.previous) ? [...player.queue.previous] : [],
+    tracks: Array.isArray(player.queue.tracks) ? [...player.queue.tracks] : [],
+    repeatMode: player.repeatMode || player.queue.repeatMode || 'off'
+  };
+}
+
 function createQueueManager(ctx) {
   async function ensureGuildDoc(guildId) {
     return storage.loadDocument(storage.COLLECTIONS.guilds, guildId) || {
@@ -125,69 +136,67 @@ function createQueueManager(ctx) {
 
     await withLock(`queue:${guildId}`, async () => {
       const queueSize = player.queue.tracks.length;
-      if (queueSize + normalized.length > musicConfig.maxQueueSize) {
-        throw new Error(`Queue limit reached (${musicConfig.maxQueueSize})`);
+      let allowedCount = musicConfig.maxQueueSize - queueSize;
+
+      if (allowedCount <= 0) {
+        throw new Error(`隊列已滿，最多只能容納 ${musicConfig.maxQueueSize} 首歌！`);
       }
 
       const requesterId = requester?.id || requester?.user?.id || null;
       if (requesterId) {
         const existingCount = countQueuedForUser(player, requesterId);
-        if (existingCount + normalized.length > musicConfig.maxSongsPerUser) {
-          throw new Error(`User queue limit reached (${musicConfig.maxSongsPerUser})`);
+        const userAllowedCount = musicConfig.maxSongsPerUser - existingCount;
+        if (userAllowedCount <= 0) {
+          throw new Error(`你點的歌已達上限，每人最多只能點 ${musicConfig.maxSongsPerUser} 首！`);
         }
+        // 取兩者限制中較小的值
+        allowedCount = Math.min(allowedCount, userAllowedCount);
       }
 
-      await player.queue.add(normalized);
+      // ✂️ 自動截斷：只加入可以容納數量的歌曲
+      const finalTracks = normalized.slice(0, allowedCount);
+
+      await player.queue.add(finalTracks);
+
+      const guildName = ctx.client.guilds.cache.get(guildId)?.name || guildId;
+      const userName = requester?.tag || requester?.user?.tag || 'Unknown';
+      
+      const logger = require('./logger');
+      logger.info({
+        emoji: '➕', title: '新增歌曲',
+        guild: guildName, user: userName,
+        details: `歌曲：${normalizeTrackTitle(finalTracks[0])}${finalTracks.length > 1 ? ` 等 ${finalTracks.length} 首歌` : ''}\n位置：#${player.queue.tracks.length - finalTracks.length + 1}\n目前佇列：${player.queue.tracks.length}`
+      });
+
       const guildDoc = await ensureGuildDoc(guildId);
       const nextGuildStats = {
         ...guildDoc.stats,
-        requestCount: (guildDoc.stats?.requestCount || 0) + (origin === 'play' ? normalized.length : 0),
+        requestCount: (guildDoc.stats?.requestCount || 0) + (origin === 'play' ? finalTracks.length : 0),
       };
 
       await saveGuildDoc(guildId, {
-        queue: player.queue.toJSON(),
+        queue: serializeQueue(player),
         stats: nextGuildStats,
       });
 
       if (origin === 'play' && requesterId) {
         const userDoc = await storage.loadDocument(storage.COLLECTIONS.users, requesterId) || {
-          _id: requesterId,
-          userId: requesterId,
-          playCount: 0,
-          requestCount: 0,
-          title: null,
-          createdAt: new Date().toISOString(),
+          _id: requesterId, userId: requesterId, playCount: 0, requestCount: 0, title: null, createdAt: new Date().toISOString(),
         };
         await storage.saveDocument(storage.COLLECTIONS.users, requesterId, {
           ...userDoc,
-          requestCount: (userDoc.requestCount || 0) + normalized.length,
+          requestCount: (userDoc.requestCount || 0) + finalTracks.length,
           updatedAt: new Date().toISOString(),
         });
       }
 
-      for (const track of normalized) {
+      for (const track of finalTracks) {
         const trackKey = buildTrackKey(track);
         const trackDoc = await storage.loadDocument(storage.COLLECTIONS.tracks, trackKey) || {
-          _id: trackKey,
-          trackKey,
-          title: normalizeTrackTitle(track),
-          author: normalizeTrackAuthor(track),
-          duration: normalizeTrackDuration(track),
-          playCount: 0,
-          requestCount: 0,
-          createdAt: new Date().toISOString(),
+          _id: trackKey, trackKey, title: normalizeTrackTitle(track), author: normalizeTrackAuthor(track), duration: normalizeTrackDuration(track), playCount: 0, requestCount: 0, createdAt: new Date().toISOString(),
         };
         await storage.saveDocument(storage.COLLECTIONS.tracks, trackKey, {
-          ...trackDoc,
-          title: normalizeTrackTitle(track),
-          author: normalizeTrackAuthor(track),
-          duration: normalizeTrackDuration(track),
-          uri: track?.info?.uri || track?.uri || null,
-          identifier: track?.info?.identifier || track?.identifier || null,
-          requestCount: (trackDoc.requestCount || 0) + 1,
-          lastRequestedAt: new Date().toISOString(),
-          lastRequesterId: requesterId || null,
-          updatedAt: new Date().toISOString(),
+          ...trackDoc, title: normalizeTrackTitle(track), author: normalizeTrackAuthor(track), duration: normalizeTrackDuration(track), uri: track?.info?.uri || track?.uri || null, identifier: track?.info?.identifier || track?.identifier || null, requestCount: (trackDoc.requestCount || 0) + 1, lastRequestedAt: new Date().toISOString(), lastRequesterId: requesterId || null, updatedAt: new Date().toISOString(),
         });
       }
     });
@@ -210,7 +219,7 @@ function createQueueManager(ctx) {
   async function skipNext(player, amount = 1) {
     if (!player) throw new Error('Player not found');
     await player.skip(amount, true);
-    await saveGuildDoc(player.guildId, { queue: player.queue.toJSON() });
+    await saveGuildDoc(player.guildId, { queue: serializeQueue(player) }); // 修復點
   }
 
   async function playPrevious(player) {
@@ -218,7 +227,7 @@ function createQueueManager(ctx) {
     const previous = await player.queue.shiftPrevious();
     if (!previous) throw new Error('No previous track found');
     await player.play({ clientTrack: previous });
-    await saveGuildDoc(player.guildId, { queue: player.queue.toJSON() });
+    await saveGuildDoc(player.guildId, { queue: serializeQueue(player) }); // 修復點
     return previous;
   }
 
@@ -226,7 +235,7 @@ function createQueueManager(ctx) {
     if (!player) throw new Error('Player not found');
     await player.setRepeatMode(mode);
     await saveGuildDoc(player.guildId, {
-      queue: player.queue.toJSON(),
+      queue: serializeQueue(player), // 修復點
       settings: { repeatMode: mode },
     });
     return mode;
@@ -246,7 +255,7 @@ function createQueueManager(ctx) {
     }
 
     await saveGuildDoc(player.guildId, {
-      queue: player.queue.toJSON(),
+      queue: serializeQueue(player), // 修復點
       settings: { shuffleEnabled: nextState },
     });
 
@@ -263,7 +272,7 @@ function createQueueManager(ctx) {
       player.queue.previous.length = 0;
     }
     await saveGuildDoc(player.guildId, {
-      queue: player.queue.toJSON(),
+      queue: serializeQueue(player), // 修復點
       settings: { shuffleEnabled: false, repeatMode: 'off' },
     });
   }

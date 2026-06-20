@@ -1,5 +1,6 @@
 const { EmbedBuilder } = require('discord.js');
 const musicConfig = require('../config/music');
+const logger = require('./logger'); // 引入日誌系統
 
 function createVoiceManager(ctx) {
   const leaveTimers = new Map();
@@ -29,6 +30,12 @@ function createVoiceManager(ctx) {
       const textChannel = textChannelId ? guild.channels.cache.get(textChannelId) : null;
 
       await ctx.playerManager.destroy(player, 'empty-channel', { clearState: true, clearQueue: false }).catch(() => {});
+
+      // 🔇 日誌：自動離開
+      logger.info({
+        emoji: '🔇', title: 'Bot 離開語音',
+        guild: guild.name, details: '原因：頻道無人'
+      });
 
       if (textChannel && textChannel.isTextBased()) {
         const embed = new EmbedBuilder()
@@ -99,7 +106,16 @@ function createVoiceManager(ctx) {
     const voiceChannel = await requireVoiceForPlay(interaction);
     const existing = ctx.playerManager.getPlayer(interaction.guildId);
     if (!existing) {
-      return ctx.playerManager.ensurePlayer(interaction, voiceChannel.id, interaction.channelId);
+      const player = await ctx.playerManager.ensurePlayer(interaction, voiceChannel.id, interaction.channelId);
+      
+      // 🔊 日誌：首次加入
+      logger.info({
+        emoji: '🔊', title: 'Bot 加入語音頻道',
+        guild: interaction.guild?.name || interaction.guildId,
+        details: `頻道：${voiceChannel.name}\n人數：${voiceChannel.members.size}`
+      });
+
+      return player;
     }
 
     if (!ctx.playerManager.canControl(interaction.member, existing, existing.queue?.current?.musicMeta?.requesterId)) {
@@ -114,6 +130,13 @@ function createVoiceManager(ctx) {
         voiceChannelId: voiceChannel.id,
         textChannelId: interaction.channelId,
         panelChannelId: interaction.channelId,
+      });
+
+      // 🔊 日誌：轉移頻道
+      logger.info({
+        emoji: '🔊', title: 'Bot 轉移語音頻道',
+        guild: interaction.guild?.name || interaction.guildId,
+        details: `頻道：${voiceChannel.name}\n人數：${voiceChannel.members.size}`
       });
     }
 
@@ -147,6 +170,14 @@ function createVoiceManager(ctx) {
       panelChannelId: interaction.channelId,
     });
     clearLeaveTimer(interaction.guildId);
+
+    // ⚠️ 日誌：強制加入
+    logger.warn({
+      emoji: '⚠️', title: '使用者強制拉機器人進語音',
+      guild: interaction.guild?.name, user: interaction.user.tag,
+      details: `頻道：${voiceChannel.name}\n指令：加入語音`
+    });
+
     return player;
   }
 
@@ -165,6 +196,13 @@ function createVoiceManager(ctx) {
     await ctx.playerManager.destroy(player, 'manual-leave', { clearState: true, clearQueue: false });
     await ctx.playerManager.clearPanelRefs(interaction.guildId).catch(() => {});
     clearLeaveTimer(interaction.guildId);
+
+    // 🔇 日誌：手動踢出
+    logger.info({
+      emoji: '🔇', title: 'Bot 離開語音',
+      guild: interaction.guild?.name, user: interaction.user.tag,
+      details: '原因：使用者手動停止'
+    });
 
     if (announce && channel && channel.isTextBased()) {
       const embed = new EmbedBuilder()
