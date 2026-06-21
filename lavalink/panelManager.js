@@ -5,15 +5,16 @@ const {
   EmbedBuilder,
 } = require('discord.js');
 const musicConfig = require('../config/music');
-const storage = require('./storage');
-const {
-  clamp,
-  formatDuration,
-  normalizeTrackAuthor,
-  normalizeTrackDuration,
-  normalizeTrackTitle,
-  truncate,
-} = require('./shared');
+const { clamp, formatDuration, normalizeTrackAuthor, normalizeTrackDuration, normalizeTrackTitle, truncate } = require('./shared');
+
+// 🚀 核心修復：使用 Promise 鏈取代單純的 while 迴圈，達成「絕對排隊機制」
+const panelLocks = new Map();
+function withPanelLock(guildId, task) {
+  const prev = panelLocks.get(guildId) || Promise.resolve();
+  const next = prev.catch(() => {}).then(task);
+  panelLocks.set(guildId, next);
+  return next;
+}
 
 function createPanelManager(ctx) {
   function buildFooter(player, state) {
@@ -33,8 +34,8 @@ function createPanelManager(ctx) {
       .setTimestamp();
 
     if (status === 'stopped' || !current) {
-      embed.setTitle('🛑 目前沒有播放中的歌曲');
-      embed.setDescription('隊列已清空，快使用指令或貼上網址來點首新歌吧！');
+      embed.setTitle('✅ 播放完畢！');
+      embed.setDescription('列表裡沒有歌曲了，使用 `/音樂 播放` 進行添加，或者點擊下方按鈕添加！');
     } else {
       const title = normalizeTrackTitle(current);
       const author = normalizeTrackAuthor(current);
@@ -52,17 +53,21 @@ function createPanelManager(ctx) {
       const artwork = current?.info?.artworkUrl || current?.info?.thumbnail || current?.thumbnail;
       if (artwork) embed.setThumbnail(artwork);
     }
-
     return embed;
   }
 
-  async function getMainComponents(player) {
+  async function getMainComponents(player, status = 'playing') {
+    if (status === 'stopped') {
+      return [new ActionRowBuilder().addComponents(
+        new ButtonBuilder().setCustomId('music:panel:addsong').setLabel('➕ 添加歌曲').setStyle(ButtonStyle.Success)
+      )];
+    }
+
     const current = player?.queue?.current;
     const paused = Boolean(player?.paused);
     const repeatMode = player?.repeatMode || 'off';
     const state = await ctx.playerManager.getGuildState(player.guildId);
     const shuffleEnabled = Boolean(state?.settings?.shuffleEnabled);
-
     const noTrack = !current;
 
     const row1 = new ActionRowBuilder().addComponents(
@@ -73,6 +78,7 @@ function createPanelManager(ctx) {
     );
 
     const row2 = new ActionRowBuilder().addComponents(
+      new ButtonBuilder().setCustomId('music:panel:addsong').setLabel('➕ 添加歌曲').setStyle(ButtonStyle.Success), 
       new ButtonBuilder().setCustomId('music:panel:shuffle').setLabel(shuffleEnabled ? '🔀 交錯 on' : '🔀 交錯 off').setStyle(shuffleEnabled ? ButtonStyle.Success : ButtonStyle.Secondary).setDisabled((player?.queue?.tracks?.length || 0) < 2),
       new ButtonBuilder().setCustomId('music:panel:queue').setLabel('📜 隊列').setStyle(ButtonStyle.Primary),
       new ButtonBuilder().setCustomId('music:panel:stop').setLabel('🛑 停止').setStyle(ButtonStyle.Danger).setDisabled(noTrack),
@@ -81,79 +87,59 @@ function createPanelManager(ctx) {
     return [row1, row2];
   }
 
-  async function resolveTextChannel(player) {
-    const state = await ctx.playerManager.getGuildState(player.guildId);
-    const channelId = state?.state?.textChannelId || player.textChannelId || state?.state?.panelChannelId;
-    if (!channelId) return null;
-    return ctx.client.channels.fetch(channelId).catch(() => null);
-  }
-
-  async function resolvePanelMessage(player, channel) {
-    const state = await ctx.playerManager.getGuildState(player.guildId);
-    const messageId = state?.state?.panelMessageId;
-    if (!messageId || !channel?.messages?.fetch) return null;
-    return channel.messages.fetch(messageId).catch(() => null);
-  }
-
   async function savePanelRefs(player, channelId, messageId) {
     await ctx.playerManager.updatePanelRefs(player.guildId, { panelChannelId: channelId, panelMessageId: messageId, textChannelId: channelId });
   }
 
-  // 🚀 核心修復：完美的單行道面板收發機制
   async function sendOrEditNowPlaying(player, { status = 'playing', forceNew = false } = {}) {
     if (!player) return null;
-    const channel = await resolveTextChannel(player);
-    if (!channel || !channel.isTextBased()) return null;
+    const guildId = player.guildId;
 
-    const state = await ctx.playerManager.getGuildState(player.guildId);
-    const embed = buildNowPlayingEmbed(player, state, status);
-    const components = await getMainComponents(player);
-    const payload = { embeds: [embed], components };
-
-    if (forceNew) {
-      // 強制下推：刪除舊的，發送新的
-      const oldMsg = await resolvePanelMessage(player, channel);
-      if (oldMsg) await oldMsg.delete().catch(() => {});
+    // 將所有發送邏輯包裝在絕對排隊鎖內
+    return withPanelLock(guildId, async () => {
+      const state = await ctx.playerManager.getGuildState(guildId);
+      const targetChannelId = state?.state?.textChannelId;
+      if (!targetChannelId) return null;
       
-      try {
-        const sent = await channel.send(payload);
-        await savePanelRefs(player, channel.id, sent.id);
+      const targetChannel = ctx.client.channels.cache.get(targetChannelId) || await ctx.client.channels.fetch(targetChannelId).catch(() => null);
+      if (!targetChannel || !targetChannel.isTextBased()) return null;
+
+      const embed = buildNowPlayingEmbed(player, state, status);
+      const components = await getMainComponents(player, status);
+      const payload = { embeds: [embed], components };
+
+      const oldChannelId = state?.state?.panelChannelId;
+      const oldMessageId = state?.state?.panelMessageId;
+      let oldMessage = null;
+
+      if (oldChannelId && oldMessageId) {
+        const oldChannel = ctx.client.channels.cache.get(oldChannelId) || await ctx.client.channels.fetch(oldChannelId).catch(() => null);
+        if (oldChannel && oldChannel.messages) {
+          oldMessage = await oldChannel.messages.fetch(oldMessageId).catch(() => null);
+        }
+      }
+
+      const channelSwitched = oldChannelId && targetChannelId && oldChannelId !== targetChannelId;
+
+      if (forceNew || channelSwitched) {
+        if (oldMessage) await oldMessage.delete().catch(() => {});
+        const sent = await targetChannel.send(payload).catch(() => null);
+        if (sent) await savePanelRefs(player, targetChannel.id, sent.id);
         return sent;
-      } catch (err) { return null; }
-    } else {
-      // 正常編輯（例如按暫停、新增歌曲更新數量）
-      const message = await resolvePanelMessage(player, channel);
-      if (message) {
-        try {
-          await message.edit(payload);
-          return message;
-        } catch (err) { }
+      } 
+      
+      if (oldMessage) {
+        try { return await oldMessage.edit(payload); } catch (err) {}
       }
       
-      // 如果舊的被使用者手動刪了，就重發
-      try {
-        const sent = await channel.send(payload);
-        await savePanelRefs(player, channel.id, sent.id);
-        return sent;
-      } catch (err) { return null; }
-    }
+      const sent = await targetChannel.send(payload).catch(() => null);
+      if (sent) await savePanelRefs(player, targetChannel.id, sent.id);
+      return sent;
+    });
   }
 
   async function markStopped(player) {
-    if (!player) return;
-    const channel = await resolveTextChannel(player);
-    if (!channel || !channel.isTextBased()) return;
-    const state = await ctx.playerManager.getGuildState(player.guildId);
-    const embed = buildNowPlayingEmbed(player, state, 'stopped');
-    const components = await getMainComponents(player); 
-    
-    const oldMsg = await resolvePanelMessage(player, channel);
-    if (oldMsg) {
-      await oldMsg.edit({ embeds: [embed], components }).catch(() => {});
-    } else {
-      const sent = await channel.send({ embeds: [embed], components }).catch(() => null);
-      if (sent) await savePanelRefs(player, channel.id, sent.id).catch(() => {});
-    }
+    return sendOrEditNowPlaying(player, { status: 'stopped', forceNew: true });
   }
 
   function buildQueueEmbed(player, state, page = 1) {
@@ -176,9 +162,12 @@ function createPanelManager(ctx) {
   }
 
   async function sendQueuePanel(player, page = 1, userId = null) {
-    const channel = await resolveTextChannel(player);
-    if (!channel || !channel.isTextBased()) return null;
     const state = await ctx.playerManager.getGuildState(player.guildId);
+    const channelId = state?.state?.textChannelId;
+    if (!channelId) return null;
+    const channel = ctx.client.channels.cache.get(channelId) || await ctx.client.channels.fetch(channelId).catch(() => null);
+    if (!channel || !channel.isTextBased()) return null;
+
     const { embed, pages, safePage } = buildQueueEmbed(player, state, page);
     const sessionId = ctx.interactionHandler.registerQueueSession({ guildId: player.guildId, userId, channelId: channel.id, messageId: null, page: safePage, pages, expiresAt: Date.now() + musicConfig.searchTimeoutMs });
 
@@ -205,13 +194,16 @@ function createPanelManager(ctx) {
       new ButtonBuilder().setCustomId(`music:queue:${session.id}:next`).setLabel('下一頁 ▶').setStyle(ButtonStyle.Primary).setDisabled(safePage >= pages),
       new ButtonBuilder().setCustomId(`music:queue:${session.id}:close`).setLabel('關閉').setStyle(ButtonStyle.Danger),
     );
-
     return interaction.update({ embeds: [embed], components: [row] });
   }
 
   async function showErrorPrompt(player, track, reason) {
-    const channel = await resolveTextChannel(player);
+    const state = await ctx.playerManager.getGuildState(player.guildId);
+    const channelId = state?.state?.textChannelId;
+    if (!channelId) return null;
+    const channel = ctx.client.channels.cache.get(channelId) || await ctx.client.channels.fetch(channelId).catch(() => null);
     if (!channel || !channel.isTextBased()) return null;
+
     const sessionId = ctx.interactionHandler.registerErrorPrompt({ guildId: player.guildId, channelId: channel.id, playerGuildId: player.guildId, trackKey: track?.musicMeta?.requestId || track?.info?.identifier || null, expiresAt: Date.now() + 30_000 });
 
     const embed = new EmbedBuilder().setColor(0xED4245).setTitle('⚠️ 歌曲無法播放').setDescription([`歌曲：${truncate(normalizeTrackTitle(track), 80)}`, `原因：${truncate(reason?.message || String(reason || 'Unknown error'), 500)}`, '', '要保留播放器與隊列嗎？'].join('\n')).setFooter({ text: '30 秒內未操作將自動忽略' }).setTimestamp();
@@ -225,24 +217,10 @@ function createPanelManager(ctx) {
     return sent;
   }
 
-  async function refreshNowPlaying(player, status = 'playing') {
-    return sendOrEditNowPlaying(player, { status });
-  }
-
-  async function handleTrackStart(player, track) {
-    return sendOrEditNowPlaying(player, { status: 'playing', forceNew: true });
-  }
-
-  async function handleTrackPaused(player) {
-    return sendOrEditNowPlaying(player, { status: 'paused' });
-  }
-
-  async function handleTrackStopped(player) {
-    await markStopped(player);
-    if (player?.guildId) {
-      await ctx.playerManager.clearPanelRefs(player.guildId).catch(() => {});
-    }
-  }
+  async function refreshNowPlaying(player, status = 'playing') { return sendOrEditNowPlaying(player, { status }); }
+  async function handleTrackStart(player, track) { return sendOrEditNowPlaying(player, { status: 'playing', forceNew: true }); }
+  async function handleTrackPaused(player) { return sendOrEditNowPlaying(player, { status: 'paused' }); }
+  async function handleTrackStopped(player) { return markStopped(player); }
 
   return {
     buildNowPlayingEmbed, buildQueueEmbed, getMainComponents, sendOrEditNowPlaying,
@@ -250,5 +228,4 @@ function createPanelManager(ctx) {
     handleTrackStart, handleTrackPaused, handleTrackStopped,
   };
 }
-
 module.exports = createPanelManager;

@@ -15,6 +15,9 @@ function createMusicSystem(client) {
   ctx.playerManager = createPlayerManager(ctx); ctx.queueManager = createQueueManager(ctx); ctx.panelManager = createPanelManager(ctx);
   ctx.interactionHandler = createInteractionHandler(ctx); ctx.voiceManager = createVoiceManager(ctx); ctx.searchManager = createSearchManager(ctx); ctx.nodeManager = createNodeManager(ctx);
 
+  // 🚀 核心修復：防止 Discord 重新連線時，重複綁定事件導致雙重日誌與面板
+  let isEventsRegistered = false;
+
   const system = {
     enabled: musicConfig.enabled, config: musicConfig, manager: null, storage,
     playerManager: ctx.playerManager, queueManager: ctx.queueManager, panelManager: ctx.panelManager, searchManager: ctx.searchManager, voiceManager: ctx.voiceManager, interactionHandler: ctx.interactionHandler, nodeManager: ctx.nodeManager,
@@ -24,34 +27,40 @@ function createMusicSystem(client) {
       const manager = await ctx.nodeManager.init(botUser || client.user || { id: client.user?.id, username: client.user?.username }).catch(() => null);
       ctx.manager = manager; system.manager = manager;
 
-      manager.on('trackStart', async (player, track) => {
-        const guild = client.guilds.cache.get(player.guildId);
-        logger.info({ emoji: '🎵', title: '開始播放', guild: guild?.name, user: track.requester?.tag || track.musicMeta?.requesterTag || 'Unknown', node: player.node?.id || 'MainNode', details: `歌曲：${track.info.title}\n作者：${track.info.author}\n長度：${formatDuration(track.info.length)}` });
-        await ctx.panelManager.handleTrackStart(player, track).catch(() => {});
-      });
+      // 如果還沒註冊過事件，才進行註冊
+      if (!isEventsRegistered && manager) {
+        isEventsRegistered = true;
 
-      manager.on('trackEnd', (player, track, payload) => {
-        if (payload.reason === 'replaced') return;
-        const guild = client.guilds.cache.get(player.guildId);
-        logger.info({ emoji: '✅', title: '歌曲播放完成', guild: guild?.name, details: `歌曲：${track.info.title}\n播放完成：${payload.reason === 'finished'}` });
-      });
+        manager.on('trackStart', async (player, track) => {
+          const guild = client.guilds.cache.get(player.guildId);
+          logger.info({ emoji: '🎵', title: '開始播放', guild: guild?.name, user: track.requester?.tag || track.musicMeta?.requesterTag || 'Unknown', node: player.node?.id || 'MainNode', details: `歌曲：${track.info.title}\n作者：${track.info.author}\n長度：${formatDuration(track.info.length)}` });
+          await ctx.panelManager.handleTrackStart(player, track).catch(() => {});
+        });
 
-      // 🚀 新增：當隊列裡的歌全部播完時，觸發「已停止」的乾淨面板
-      manager.on('queueEnd', async (player, track, payload) => {
-        const guild = client.guilds.cache.get(player.guildId);
-        logger.info({ emoji: '🛑', title: '隊列播放完畢', guild: guild?.name, details: '所有歌曲已播放完畢' });
-        await ctx.panelManager.handleTrackStopped(player).catch(() => {});
-      });
+        manager.on('trackEnd', (player, track, payload) => {
+          if (payload.reason === 'replaced') return;
+          const guild = client.guilds.cache.get(player.guildId);
+          logger.info({ emoji: '✅', title: '歌曲播放完成', guild: guild?.name, details: `歌曲：${track.info.title}\n播放完成：${payload.reason === 'finished'}` });
+        });
 
-      manager.on('trackError', (player, track, payload) => {
-        const guild = client.guilds.cache.get(player.guildId);
-        logger.error({ emoji: '❌', title: '播放失敗', guild: guild?.name, node: player.node?.id, details: `歌曲：${track?.info?.title || 'Unknown'}\n原因：${payload.error || 'Track load failed'}` });
-      });
+        manager.on('queueEnd', async (player, track, payload) => {
+          if (player && !player.destroyed) {
+            const guild = client.guilds.cache.get(player.guildId);
+            logger.info({ emoji: '🛑', title: '隊列播放完畢', guild: guild?.name, details: '所有歌曲已播放完畢' });
+            await ctx.panelManager.handleTrackStopped(player).catch(() => {});
+          }
+        });
 
-      setInterval(() => {
-        const stats = logger.getSystemStats();
-        logger.info({ emoji: '📊', title: '系統狀態', details: `Active Players: ${manager.players.size}\nGuilds: ${client.guilds.cache.size}\nCPU: ${stats.cpuStr}\nMemory: ${stats.memoryStr}\nUptime: ${stats.uptimeStr}` });
-      }, 60 * 60 * 1000);
+        manager.on('trackError', (player, track, payload) => {
+          const guild = client.guilds.cache.get(player.guildId);
+          logger.error({ emoji: '❌', title: '播放失敗', guild: guild?.name, node: player.node?.id, details: `歌曲：${track?.info?.title || 'Unknown'}\n原因：${payload.error || 'Track load failed'}` });
+        });
+
+        setInterval(() => {
+          const stats = logger.getSystemStats();
+          logger.info({ emoji: '📊', title: '系統狀態', details: `Active Players: ${manager.players.size}\nGuilds: ${client.guilds.cache.size}\nCPU: ${stats.cpuStr}\nMemory: ${stats.memoryStr}\nUptime: ${stats.uptimeStr}` });
+        }, 60 * 60 * 1000);
+      }
 
       client.lavalink = manager; return manager;
     },

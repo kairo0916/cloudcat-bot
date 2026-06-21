@@ -1,6 +1,6 @@
 const { EmbedBuilder } = require('discord.js');
 const musicConfig = require('../config/music');
-const logger = require('./logger'); // 引入日誌系統
+const logger = require('./logger'); 
 
 function createVoiceManager(ctx) {
   const leaveTimers = new Map();
@@ -29,9 +29,10 @@ function createVoiceManager(ctx) {
       const textChannelId = state?.state?.textChannelId || state?.state?.panelChannelId;
       const textChannel = textChannelId ? guild.channels.cache.get(textChannelId) : null;
 
-      await ctx.playerManager.destroy(player, 'empty-channel', { clearState: true, clearQueue: false }).catch(() => {});
+      // 🚀 核心優化：發送停止面板，然後銷毀播放器，且保留 DB 內的 PanelID 確保不產生雙面板
+      await ctx.panelManager.handleTrackStopped(player).catch(() => {});
+      await ctx.playerManager.destroy(player, 'empty-channel', { clearState: false, clearQueue: false }).catch(() => {});
 
-      // 🔇 日誌：自動離開
       logger.info({
         emoji: '🔇', title: 'Bot 離開語音',
         guild: guild.name, details: '原因：頻道無人'
@@ -39,14 +40,12 @@ function createVoiceManager(ctx) {
 
       if (textChannel && textChannel.isTextBased()) {
         const embed = new EmbedBuilder()
-          .setColor(0x5865F2)
-          .setTitle('🚶 機器人離開了！')
-          .setDescription('沒人在頻道內我就離開囉~')
+          .setColor(0xED4245)
+          .setTitle('🚶頻道里的人都走了')
+          .setDescription('語音頻道超過5分鐘我就會離開咯！')
           .setTimestamp();
         await textChannel.send({ embeds: [embed] }).catch(() => {});
       }
-
-      await ctx.playerManager.clearPanelRefs(guildId).catch(() => {});
     }, musicConfig.emptyChannelTimeoutMs);
 
     leaveTimers.set(guildId, timer);
@@ -54,29 +53,14 @@ function createVoiceManager(ctx) {
 
   async function evaluateAutoLeave(guildId) {
     const player = ctx.playerManager.getPlayer(guildId);
-    if (!player) {
-      clearLeaveTimer(guildId);
-      return;
-    }
-
+    if (!player) { clearLeaveTimer(guildId); return; }
     const guild = ctx.client.guilds.cache.get(guildId);
-    if (!guild) {
-      clearLeaveTimer(guildId);
-      return;
-    }
-
+    if (!guild) { clearLeaveTimer(guildId); return; }
     const voiceChannel = guild.channels.cache.get(player.voiceChannelId);
-    if (!voiceChannel || !voiceChannel.members) {
-      clearLeaveTimer(guildId);
-      return;
-    }
-
+    if (!voiceChannel || !voiceChannel.members) { clearLeaveTimer(guildId); return; }
     const humans = voiceChannel.members.filter(member => !member.user.bot);
-    if (humans.size === 0) {
-      scheduleLeaveTimer(guildId);
-    } else {
-      clearLeaveTimer(guildId);
-    }
+    if (humans.size === 0) scheduleLeaveTimer(guildId);
+    else clearLeaveTimer(guildId);
   }
 
   async function handleVoiceStateUpdate(oldState, newState) {
@@ -90,15 +74,12 @@ function createVoiceManager(ctx) {
       clearLeaveTimer(guildId);
       return;
     }
-
     await evaluateAutoLeave(guildId);
   }
 
   async function requireVoiceForPlay(interaction) {
     const memberVoice = interaction.member?.voice?.channel;
-    if (!memberVoice) {
-      throw new Error('請先進入語音頻道');
-    }
+    if (!memberVoice) throw new Error('請先進入語音頻道');
     return memberVoice;
   }
 
@@ -107,51 +88,24 @@ function createVoiceManager(ctx) {
     const existing = ctx.playerManager.getPlayer(interaction.guildId);
     if (!existing) {
       const player = await ctx.playerManager.ensurePlayer(interaction, voiceChannel.id, interaction.channelId);
-      
-      // 🔊 日誌：首次加入
-      logger.info({
-        emoji: '🔊', title: 'Bot 加入語音頻道',
-        guild: interaction.guild?.name || interaction.guildId,
-        details: `頻道：${voiceChannel.name}\n人數：${voiceChannel.members.size}`
-      });
-
+      logger.info({ emoji: '🔊', title: 'Bot 加入語音頻道', guild: interaction.guild?.name || interaction.guildId, details: `頻道：${voiceChannel.name}\n人數：${voiceChannel.members.size}` });
       return player;
     }
-
-    if (!ctx.playerManager.canControl(interaction.member, existing, existing.queue?.current?.musicMeta?.requesterId)) {
-      throw new Error('你必須與播放器同語音頻道，或具備管理員權限');
-    }
-
+    if (!ctx.playerManager.canControl(interaction.member, existing, existing.queue?.current?.musicMeta?.requesterId)) throw new Error('你必須與播放器同語音頻道，或具備管理員權限');
     if (existing.voiceChannelId !== voiceChannel.id) {
-      existing.voiceChannelId = voiceChannel.id;
-      existing.textChannelId = interaction.channelId;
+      existing.voiceChannelId = voiceChannel.id; existing.textChannelId = interaction.channelId;
       await existing.connect();
-      await ctx.playerManager.touchVoiceState(interaction.guildId, {
-        voiceChannelId: voiceChannel.id,
-        textChannelId: interaction.channelId,
-        panelChannelId: interaction.channelId,
-      });
-
-      // 🔊 日誌：轉移頻道
-      logger.info({
-        emoji: '🔊', title: 'Bot 轉移語音頻道',
-        guild: interaction.guild?.name || interaction.guildId,
-        details: `頻道：${voiceChannel.name}\n人數：${voiceChannel.members.size}`
-      });
+      await ctx.playerManager.touchVoiceState(interaction.guildId, { voiceChannelId: voiceChannel.id, textChannelId: interaction.channelId, panelChannelId: interaction.channelId });
+      logger.info({ emoji: '🔊', title: 'Bot 轉移語音頻道', guild: interaction.guild?.name || interaction.guildId, details: `頻道：${voiceChannel.name}\n人數：${voiceChannel.members.size}` });
     }
-
     return existing;
   }
 
   async function ensureJoinAllowed(interaction) {
     const player = ctx.playerManager.getPlayer(interaction.guildId);
-    if (!player || (!player.playing && !player.queue?.current)) {
-      throw new Error('目前沒有播放中的歌曲，無法強制加入');
-    }
+    if (!player || (!player.playing && !player.queue?.current)) throw new Error('目前沒有播放中的歌曲，無法強制加入');
     const member = interaction.member;
-    if (!ctx.playerManager.canControl(member, player, player.queue?.current?.musicMeta?.requesterId)) {
-      throw new Error('你必須與播放器同語音頻道，或具備管理員權限');
-    }
+    if (!ctx.playerManager.canControl(member, player, player.queue?.current?.musicMeta?.requesterId)) throw new Error('你必須與播放器同語音頻道，或具備管理員權限');
     return player;
   }
 
@@ -160,76 +114,36 @@ function createVoiceManager(ctx) {
     const voiceChannel = interaction.member?.voice?.channel;
     if (!voiceChannel) throw new Error('請先進入語音頻道');
     if (player.voiceChannelId === voiceChannel.id) return player;
-
-    player.voiceChannelId = voiceChannel.id;
-    player.textChannelId = interaction.channelId;
+    player.voiceChannelId = voiceChannel.id; player.textChannelId = interaction.channelId;
     await player.connect();
-    await ctx.playerManager.touchVoiceState(interaction.guildId, {
-      voiceChannelId: voiceChannel.id,
-      textChannelId: interaction.channelId,
-      panelChannelId: interaction.channelId,
-    });
+    await ctx.playerManager.touchVoiceState(interaction.guildId, { voiceChannelId: voiceChannel.id, textChannelId: interaction.channelId, panelChannelId: interaction.channelId });
     clearLeaveTimer(interaction.guildId);
-
-    // ⚠️ 日誌：強制加入
-    logger.warn({
-      emoji: '⚠️', title: '使用者強制拉機器人進語音',
-      guild: interaction.guild?.name, user: interaction.user.tag,
-      details: `頻道：${voiceChannel.name}\n指令：加入語音`
-    });
-
+    logger.warn({ emoji: '⚠️', title: '使用者強制拉機器人進語音', guild: interaction.guild?.name, user: interaction.user.tag, details: `頻道：${voiceChannel.name}\n指令：加入語音` });
     return player;
   }
 
   async function leavePlayer(interaction, { clearQueue = false, announce = false } = {}) {
     const player = ctx.playerManager.getPlayer(interaction.guildId);
     if (!player) throw new Error('目前沒有播放器');
-
     const state = await ctx.playerManager.getGuildState(interaction.guildId);
     const channelId = state?.state?.textChannelId || interaction.channelId;
     const channel = interaction.guild.channels.cache.get(channelId);
 
-    if (clearQueue) {
-      await ctx.queueManager.clearQueueAndHistory(player).catch(() => {});
-    }
-
-    await ctx.playerManager.destroy(player, 'manual-leave', { clearState: true, clearQueue: false });
-    await ctx.playerManager.clearPanelRefs(interaction.guildId).catch(() => {});
+    // 🚀 核心優化：發送停止面板，然後銷毀播放器，且保留 DB 內的 PanelID
+    await ctx.panelManager.handleTrackStopped(player).catch(() => {});
+    if (clearQueue) await ctx.queueManager.clearQueueAndHistory(player).catch(() => {});
+    await ctx.playerManager.destroy(player, 'manual-leave', { clearState: false, clearQueue: false });
     clearLeaveTimer(interaction.guildId);
-
-    // 🔇 日誌：手動踢出
-    logger.info({
-      emoji: '🔇', title: 'Bot 離開語音',
-      guild: interaction.guild?.name, user: interaction.user.tag,
-      details: '原因：使用者手動停止'
-    });
+    logger.info({ emoji: '🔇', title: 'Bot 離開語音', guild: interaction.guild?.name, user: interaction.user.tag, details: '原因：使用者手動停止' });
 
     if (announce && channel && channel.isTextBased()) {
-      const embed = new EmbedBuilder()
-        .setColor(0xED4245)
-        .setTitle('🚶 機器人已離開')
-        .setDescription('已停止播放並離開語音頻道。')
-        .setTimestamp();
+      const embed = new EmbedBuilder().setColor(0xED4245).setTitle('🚶 機器人已離開').setDescription('已停止播放並離開語音頻道。').setTimestamp();
       await channel.send({ embeds: [embed] }).catch(() => {});
     }
   }
 
-  function getLeaveTimerCount() {
-    return leaveTimers.size;
-  }
+  function getLeaveTimerCount() { return leaveTimers.size; }
 
-  return {
-    clearLeaveTimer,
-    scheduleLeaveTimer,
-    handleVoiceStateUpdate,
-    requireVoiceForPlay,
-    getOrCreatePlayer,
-    joinCurrentChannel,
-    leavePlayer,
-    ensureJoinAllowed,
-    evaluateAutoLeave,
-    getLeaveTimerCount,
-  };
+  return { clearLeaveTimer, scheduleLeaveTimer, handleVoiceStateUpdate, requireVoiceForPlay, getOrCreatePlayer, joinCurrentChannel, leavePlayer, ensureJoinAllowed, evaluateAutoLeave, getLeaveTimerCount };
 }
-
 module.exports = createVoiceManager;
